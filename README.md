@@ -8,11 +8,11 @@
 
 | 模块分类 | 核心研究方向 | 当前已收录专题 |
 | :--- | :--- | :--- |
-| **[01-computer-architecture](./01-computer-architecture/)** | CPU 缓存一致性 (MESI)、内存屏障 (Memory Barriers)、TSO 乱序执行、NUMA 架构 | *规划中* |
-| **[02-operating-systems](./02-operating-systems/)** | Linux 内核调度 (CFS)、虚拟内存与 HugeTLB、VFS 与零拷贝 (splice/io_uring) | *规划中* |
+| **01-computer-architecture** | CPU 缓存一致性 (MESI)、内存屏障 (Memory Barriers)、TSO 乱序执行、NUMA 架构 | *规划中* |
+| **02-operating-systems** | Linux 内核调度 (CFS)、虚拟内存与 HugeTLB、VFS 与零拷贝 (splice/io_uring) | *规划中* |
 | **[03-high-performance-networking](./03-high-performance-networking/)** | 数据面转发、DPDK、无锁队列流水线、内核旁路 (Kernel Bypass)、eBPF/XDP | 1. [高性能通信流水线中的无锁动态生命周期安全机制](./03-high-performance-networking/lockfree-pipeline-lifecycle-safety.md) |
-| **[04-concurrency-and-algorithms](./04-concurrency-and-algorithms/)** | 无锁数据结构 (Lock-Free)、RCU/QSBR/Hazard Pointer、分布式共识 (Raft) | *规划中* |
-| **[05-hands-on-labs](./05-hands-on-labs/)** | 核心机制的迷你 POC、微基准测试 (Micro-benchmarks)、手写环形缓冲区验证 | *规划中* |
+| **[04-concurrency-and-algorithms](./04-concurrency-and-algorithms/)** | 无锁数据结构 (Lock-Free)、RCU/QSBR/Hazard Pointer、分布式共识 (Raft) | 1. [深入剖析 C11/C++11 内存模型与无锁原子操作](./04-concurrency-and-algorithms/memory-order-deep-dive.md) |
+| **[05-hands-on-labs](./05-hands-on-labs/)** | 核心机制的迷你 POC、微基准测试 (Micro-benchmarks)、手写环形缓冲区验证 | 1. [05-lockfree-pipeline (千万级PPS无锁流水线)](./05-hands-on-labs/05-lockfree-pipeline/)<br>2. [memory-order-examples (C11内存序4大经典场景)](./05-hands-on-labs/memory-order-examples/) |
 
 ---
 
@@ -51,4 +51,8 @@ npx quartz build --serve
 ## 📌 当前收录精选
 
 - 🔥 [03-high-performance-networking/lockfree-pipeline-lifecycle-safety.md](./03-high-performance-networking/lockfree-pipeline-lifecycle-safety.md)  
-  *深入剖析在多线程无锁 Ring Buffer 流水线中，报文千万级 PPS 快路径与 Channel/Session 动态销毁慢路径并发时的安全机制，采用 Drain Barrier + Generation Slot + QSBR 彻底杜绝 UAF 与 Cache-line Bouncing。*
+  *深入剖析在多线程无锁 Ring Buffer 流水线中，报文千万级 PPS 快路径与网络流 Flow 动态销毁慢路径并发时的安全机制，采用 Drain Barrier Protocol + Generational Handle + QSBR 彻底杜绝 UAF 与 Cache Line Bouncing。*
+- ⚡ [04-concurrency-and-algorithms/memory-order-deep-dive.md](./04-concurrency-and-algorithms/memory-order-deep-dive.md)  
+  *系统阐述 C11/C++11 内存模型底层原理，从编译器屏障、CPU 内存屏障、Happens-Before 偏序关系到 6 种 memory_order 的硬件级开销与最佳工程实践。*
+- 🧪 [05-hands-on-labs/05-lockfree-pipeline](./05-hands-on-labs/05-lockfree-pipeline/)  
+  *完整 C11 模块化无锁流水线工程实现，结合 ThreadSanitizer 验证与 Linux perf 压测套件，实现千万 PPS 场景下的零数据竞争与确定性回收。*
