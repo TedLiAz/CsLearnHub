@@ -1,0 +1,43 @@
+# Prerequisites & Binaries
+*.o
+*.a
+*.so
+*.dylib
+*.out
+lockfree_pipeline
+lockfree_pipeline_tsan
+01-producer-consumer
+02-spinlock
+03-double-checked-init
+04-relaxed-pitfall
+tsan-*
+
+# Sanitizer & Core Dumps
+tsan.*
+asan.*
+core
+core.*
+
+# Performance Profiling
+perf.data
+perf.data.old
+gmon.out
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+
+# Editor & OS Artefacts
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Agent Scratchpad & Temp Workspaces
+.scratch/
+*.tmp

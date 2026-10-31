@@ -57,15 +57,71 @@ related:
 
 ### 3.2 架构拓扑或时序图
 ```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'fontFamily': 'Inter, system-ui, -apple-system, sans-serif',
+    'fontSize': '14px',
+    'primaryColor': '#e0f2fe',
+    'primaryTextColor': '#0f172a',
+    'primaryBorderColor': '#0284c7',
+    'lineColor': '#64748b',
+    'secondaryColor': '#f1f5f9',
+    'tertiaryColor': '#ffffff',
+    'actorBkg': '#f8fafc',
+    'actorBorder': '#0284c7',
+    'actorTextColor': '#0f172a',
+    'actorLineColor': '#94a3b8',
+    'signalColor': '#334155',
+    'signalTextColor': '#0f172a',
+    'labelBoxBkgColor': '#f1f5f9',
+    'labelBoxBorderColor': '#cbd5e1',
+    'labelTextColor': '#0f172a',
+    'noteBkgColor': '#fef3c7',
+    'noteBorderColor': '#d97706',
+    'noteTextColor': '#78350f',
+    'activationBkgColor': '#e0f2fe',
+    'activationBorderColor': '#0284c7'
+  }
+}}%%
 sequenceDiagram
     autonumber
     participant Client
     participant Stage1
     participant Stage2
     participant Store
-    Client->>Stage1: 请求
-    Stage1->>Stage2: 异步传递
-    Stage2->>Store: 持久化
+
+    Note over Client, Stage2: 业务快路径 (异步入队传递)
+    Client->>Stage1: 提交请求
+    Stage1->>Stage2: 无锁 RingBuffer 传递
+
+    Note over Stage2, Store: 持久化慢路径 (批量刷新)
+    Stage2->>Store: 批量刷新落盘
+```
+
+### 3.3 决策分流流程图（Modern Slate 模板）
+```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'fontFamily': 'Inter, system-ui, -apple-system, sans-serif',
+    'fontSize': '13px',
+    'primaryColor': '#f8fafc',
+    'primaryTextColor': '#0f172a',
+    'primaryBorderColor': '#94a3b8',
+    'lineColor': '#64748b'
+  }
+}}%%
+flowchart TD
+    classDef default fill:#f8fafc,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a;
+    classDef accent fill:#e0f2fe,stroke:#0284c7,stroke-width:2px,color:#0369a1;
+    classDef warning fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#78350f;
+    classDef muted fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1.5px,color:#64748b;
+
+    Req[接收外部事件/请求]:::accent --> Branch{状态校验与分支选择}
+    Branch -->|快路径命中| Worker[执行核心流水线逻辑]:::accent
+    Branch -->|慢路径/排空| Drain[排空等待与状态同步]:::warning
+    Branch -->|校验失效/异常| Drop[安全拦截或释放]:::muted
 ```
 
 ---
