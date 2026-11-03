@@ -1,79 +1,123 @@
 #include "flow.h"
-#include <stdlib.h>
+#include "qsbr.h"
 #include <string.h>
 
-static FlowGenerationEntry g_flow_gen[MAX_FLOWS];
-static FlowColdContext     g_flow_cold[MAX_FLOWS];
-static FlowControlBlock    g_flow_table[MAX_FLOWS];
+void flow_table_init(FlowTable *ft) {
+    assert(ft != NULL);
+    memset(ft, 0, sizeof(*ft));
 
-void flow_subsystem_init(void) {
     for (uint32_t i = 0; i < MAX_FLOWS; ++i) {
-        atomic_init(&g_flow_gen[i].generation, 1);
-        atomic_init(&g_flow_cold[i].state, FLOW_STATE_FREE);
-        g_flow_cold[i].flow_context = NULL;
-
-        atomic_init(&g_flow_table[i].generation, 1);
-        atomic_init(&g_flow_table[i].state, FLOW_STATE_FREE);
-        g_flow_table[i].flow_context = NULL;
+        atomic_init(&ft->generations[i].generation, 1);
+        atomic_init(&ft->cold[i].state, FLOW_STATE_FREE);
+        ft->contexts[i].flow_id = i;
+        ft->contexts[i].byte_count = 0;
     }
+
+    ft->quarantine.head = 0;
+    ft->quarantine.tail = 0;
 }
 
-void flow_open(uint32_t flow_id) {
+void flow_table_open(FlowTable *ft, uint32_t flow_id) {
+    assert(ft != NULL);
     assert(flow_id < MAX_FLOWS);
 
-    FlowContext *ctx = (FlowContext *)malloc(sizeof(FlowContext));
-    assert(ctx != NULL);
-    ctx->flow_id = flow_id;
-    ctx->byte_count = 0;
+    /* Data-Oriented: Contiguous flat array assignment, zero malloc overhead */
+    ft->contexts[flow_id].flow_id = flow_id;
+    ft->contexts[flow_id].byte_count = 0;
 
-    g_flow_cold[flow_id].flow_context = ctx;
-    g_flow_table[flow_id].flow_context = ctx;
-
-    atomic_store_explicit(&g_flow_cold[flow_id].state, FLOW_STATE_ACTIVE, memory_order_release);
-    atomic_store_explicit(&g_flow_table[flow_id].state, FLOW_STATE_ACTIVE, memory_order_release);
+    atomic_store_explicit(&ft->cold[flow_id].state, FLOW_STATE_ACTIVE, memory_order_release);
 }
 
-uint32_t flow_get_generation(uint32_t flow_id) {
+void flow_table_set_state(FlowTable *ft, uint32_t flow_id, FlowState state) {
+    assert(ft != NULL);
     assert(flow_id < MAX_FLOWS);
-    return atomic_load_explicit(&g_flow_gen[flow_id].generation, memory_order_acquire);
+    atomic_store_explicit(&ft->cold[flow_id].state, (uint32_t)state, memory_order_release);
 }
 
-FlowState flow_get_state(uint32_t flow_id) {
-    assert(flow_id < MAX_FLOWS);
-    return (FlowState)atomic_load_explicit(&g_flow_cold[flow_id].state, memory_order_acquire);
-}
-
-void *flow_get_context(uint32_t flow_id) {
-    assert(flow_id < MAX_FLOWS);
-    return g_flow_cold[flow_id].flow_context;
-}
-
-FlowControlBlock *flow_get_fcb(uint32_t flow_id) {
-    assert(flow_id < MAX_FLOWS);
-    return &g_flow_table[flow_id];
-}
-
-void flow_advance_generation(uint32_t flow_id) {
+void flow_table_advance_generation(FlowTable *ft, uint32_t flow_id) {
+    assert(ft != NULL);
     assert(flow_id < MAX_FLOWS);
     /*
-     * Release store publishes that all prior packet processing in the pipeline
-     * for this flow has completely finished before the generation increments.
+     * Release store: publishes that all prior packet processing in the pipeline
+     * for this flow generation has completed before the generation increments.
+     * Single atomic RMW avoids cache line bouncing on multiple redundant tables.
      */
-    atomic_fetch_add_explicit(&g_flow_gen[flow_id].generation, 1, memory_order_release);
-    atomic_fetch_add_explicit(&g_flow_table[flow_id].generation, 1, memory_order_release);
+    atomic_fetch_add_explicit(&ft->generations[flow_id].generation, 1, memory_order_release);
 }
 
-void flow_set_state(uint32_t flow_id, FlowState state) {
+bool flow_table_retire_to_quarantine(
+    FlowTable *ft,
+    uint32_t flow_id,
+    uint32_t generation,
+    uint64_t target_epoch
+) {
+    assert(ft != NULL);
     assert(flow_id < MAX_FLOWS);
-    atomic_store_explicit(&g_flow_cold[flow_id].state, (uint32_t)state, memory_order_release);
-    atomic_store_explicit(&g_flow_table[flow_id].state, (uint32_t)state, memory_order_release);
+
+    /*
+     * Enforce strict retirement sequence:
+     * 1. Monotonically increment generation, instantly invalidating stale handles.
+     * 2. Transition state to QUIESCENT.
+     * 3. Record target epoch barrier into quarantine pool.
+     */
+    flow_table_advance_generation(ft, flow_id);
+    flow_table_set_state(ft, flow_id, FLOW_STATE_QUIESCENT);
+
+    if (ft->quarantine.head - ft->quarantine.tail >= QUARANTINE_RING_SIZE) {
+        return false;
+    }
+
+    QuarantineEntry *entry = &ft->quarantine.entries[ft->quarantine.head % QUARANTINE_RING_SIZE];
+    entry->flow_id      = flow_id;
+    entry->generation   = generation;
+    entry->target_epoch = target_epoch;
+    ft->quarantine.head++;
+
+    return true;
 }
 
-void flow_reclaim_context(uint32_t flow_id) {
-    assert(flow_id < MAX_FLOWS);
-    free(g_flow_cold[flow_id].flow_context);
-    g_flow_cold[flow_id].flow_context = NULL;
-    g_flow_table[flow_id].flow_context = NULL;
-    atomic_store_explicit(&g_flow_cold[flow_id].state, FLOW_STATE_FREE, memory_order_release);
-    atomic_store_explicit(&g_flow_table[flow_id].state, FLOW_STATE_FREE, memory_order_release);
+uint64_t flow_table_poll_reclaim(FlowTable *ft, struct QSBRModule *qsbr) {
+    assert(ft != NULL);
+    assert(qsbr != NULL);
+
+    uint64_t reclaimed = 0;
+
+    /*
+     * FIFO epoch ordering: entries are enqueued in non-decreasing target epoch snapshots.
+     * If head-of-queue has not cleared its target epoch barrier, none of subsequent entries
+     * can have cleared it either, enabling O(1) early exit.
+     */
+    while (ft->quarantine.head != ft->quarantine.tail) {
+        QuarantineEntry *entry = &ft->quarantine.entries[ft->quarantine.tail % QUARANTINE_RING_SIZE];
+        if (qsbr_check_all_quiescent(qsbr, entry->target_epoch)) {
+            uint32_t flow_id = entry->flow_id;
+            ft->quarantine.tail++;
+
+            /* Data-Oriented: Zero heap free(), simply clear flat context and reset state to FREE */
+            ft->contexts[flow_id].byte_count = 0;
+            atomic_store_explicit(&ft->cold[flow_id].state, FLOW_STATE_FREE, memory_order_release);
+            reclaimed++;
+        } else {
+            break;
+        }
+    }
+
+    return reclaimed;
+}
+
+bool flow_table_audit_clean(const FlowTable *ft, uint32_t num_flows) {
+    assert(ft != NULL);
+    assert(num_flows <= MAX_FLOWS);
+
+    if (ft->quarantine.head != ft->quarantine.tail) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < num_flows; ++i) {
+        if (flow_table_get_state(ft, i) != FLOW_STATE_FREE) {
+            return false;
+        }
+    }
+
+    return true;
 }

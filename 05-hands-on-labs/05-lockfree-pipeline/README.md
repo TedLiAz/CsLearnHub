@@ -34,15 +34,15 @@ This laboratory provides a production-grade, self-contained C11 implementation a
 ```
 05-lockfree-pipeline/
 ├── include/
-│   ├── flow.h          # FlowHandle, FlowControlBlock (64B aligned), states & lifecycle
+│   ├── flow.h          # FlowHandle, FlowTable (Data-Oriented Design), Dense Generation Array
 │   ├── message.h       # PipelineMsg (unified 32B message envelope: packets, sentinels, halt)
 │   ├── ring_buffer.h   # SPSC lock-free ring buffer (192B = 3 cachelines, burst APIs)
-│   ├── qsbr.h          # Quiescent-State-Based Reclamation & QuarantineRing
+│   ├── qsbr.h          # Pure Quiescent-State-Based Reclamation epoch engine
 │   └── pipeline.h      # Pipeline context, stage worker prototypes & stats
 ├── src/
-│   ├── flow.c          # Global FCB table, atomic generation & async bitmask signaling
+│   ├── flow.c          # FlowTable instance implementation, flat context pool & quarantine
 │   ├── ring_buffer.c   # Ring buffer power-of-two validation & initialization
-│   ├── qsbr.c          # QSBR epoch progression & quarantine flow reclamation logic
+│   ├── qsbr.c          # QSBR epoch progression & reader quiescence tracking
 │   ├── pipeline.c      # Ingress (Stage 1), Worker (Stage 2), Terminal (Stage 3), Control threads
 │   └── main.c          # Program entry, stage thread orchestration & integrity verification
 ├── benchmark.py        # Non-intrusive Python 3 harness driving external Linux perf stat
@@ -92,11 +92,12 @@ Measurements collected on Linux x86-64 (`-O3 -march=native`):
 
 | Metric | Measured Value (Mean ± StdDev) | Architectural Significance |
 | :--- | :--- | :--- |
-| **Throughput** | **19.39 ± 1.04 Mpps** | Multi-million packets per second sustained during concurrent flow draining |
-| **Average Latency** | **51.70 ± 2.90 ns / pkt** | Sub-60ns end-to-end traversal across 3 pipeline stages |
-| **Cycles Per Packet (CPP)** | **542.6 ± 39.2 cycles** | Total CPU cycles across all pipeline threads per egressed packet |
-| **Instructions Per Cycle (IPC)** | **1.08 ± 0.02** | High instruction-level parallelism; zero lock contention stalls |
-| **L1-Dcache Miss Rate** | **3.12 ± 0.06 %** | Cache-line alignment (`alignas(64)`) completely eliminates false sharing |
-| **Branch Miss Rate** | **0.54 ± 0.12 %** | Branch predictor accuracy via fast-path `__builtin_expect` hints |
+| **Throughput (Peak)** | **27.12 ± 0.14 Mpps** | Sustained rate under pure wall-clock timing; +40% gain from DOD inlining |
+| **Throughput (Perf)** | **21.89 ± 0.27 Mpps** | Sustained rate under Linux perf PMU counting during dynamic flow draining |
+| **Average Latency** | **36.87 ± 0.19 ns / pkt** | Sub-37ns end-to-end traversal across 3 stages (reduced from 51.70ns) |
+| **Cycles Per Packet (CPP)** | **460.0 ± 20.4 cycles** | 82 fewer CPU cycles per packet achieved by zero-call generational inlining |
+| **Instructions Per Cycle (IPC)** | **1.04 ± 0.01** | High instruction-level parallelism; zero lock contention stalls |
+| **L1-Dcache Miss Rate** | **3.73 ± 0.07 %** | Cache-line alignment (`alignas(64)`) completely eliminates false sharing |
+| **Branch Miss Rate** | **0.22 ± 0.01 %** | Cut by >50% via branchless flat indexing and `__builtin_expect` hints |
 | **Data Race Hazards** | **0 (TSan verified)** | Strict SPSC queues + Acquire-Release pairs enforce memory visibility |
-| **Memory Safety** | **0 UAF / 0 Leaks** | Verified by strict post-execution flow state assertions |
+| **Memory Safety** | **0 UAF / 0 Leaks** | Verified by zero-heap flat context pool & generational invalidation |

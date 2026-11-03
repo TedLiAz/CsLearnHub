@@ -49,6 +49,7 @@ typedef struct {
     alignas(64) PipelineMsg ring1_buf[RING_CAPACITY];
     alignas(64) PipelineMsg ring2_buf[RING_CAPACITY];
     alignas(64) PipelineMsg ctrl_ring_buf[RING_CAPACITY];
+    FlowTable               flow_table;
     QSBRModule              qsbr;
 
     uint64_t                total_packets;

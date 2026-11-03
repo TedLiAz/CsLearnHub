@@ -56,14 +56,17 @@ static inline void pipeline_msg_init_packet(
     uint32_t flow_hash,
     uint32_t data_len
 ) {
-    memset(msg, 0, sizeof(*msg));
+    /* Explicit field assignment eliminates redundant 32B memset on fast path */
     msg->type              = MSG_TYPE_PACKET;
+    msg->sub_type          = 0;
+    msg->flags             = 0;
     msg->handle.flow_id    = flow_id;
     msg->handle.generation = generation;
     msg->flow_hash         = flow_hash;
     msg->pkt_payload       = NULL;
     msg->data_len          = data_len;
     msg->queue_id          = 0;
+    msg->rsvd              = 0;
 }
 
 static inline void pipeline_msg_init_drain_sentinel(
@@ -71,17 +74,25 @@ static inline void pipeline_msg_init_drain_sentinel(
     uint32_t flow_id,
     uint32_t generation
 ) {
-    memset(msg, 0, sizeof(*msg));
     msg->type              = MSG_TYPE_DRAIN_SENTINEL;
+    msg->sub_type          = 0;
+    msg->flags             = 0;
     msg->handle.flow_id    = flow_id;
     msg->handle.generation = generation;
+    msg->flow_hash         = 0;
     msg->sentinel_seq      = 0;
     msg->barrier_ack       = NULL;
 }
 
 static inline void pipeline_msg_init_halt(PipelineMsg *msg) {
-    memset(msg, 0, sizeof(*msg));
-    msg->type = MSG_TYPE_PIPELINE_HALT;
+    msg->type              = MSG_TYPE_PIPELINE_HALT;
+    msg->sub_type          = 0;
+    msg->flags             = 0;
+    msg->handle.flow_id    = 0;
+    msg->handle.generation = 0;
+    msg->flow_hash         = 0;
+    msg->sentinel_seq      = 0;
+    msg->barrier_ack       = NULL;
 }
 
 static inline bool pipeline_msg_is_halt(const PipelineMsg *msg) {

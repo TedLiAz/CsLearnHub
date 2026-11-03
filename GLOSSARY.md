@@ -24,6 +24,10 @@ _Avoid_: Command bus, signal mask
 A cache-optimized, contiguous array storing only hot generation counters and state flags packed to fit multiple flows per cache line.
 _Avoid_: FCB array, monolithic flow table
 
+**FlowTable**:
+The encapsulated, cacheline-aligned data-oriented container integrating the Dense Generation Array, cold context table, flat pre-allocated context pool, and quarantine pool with zero heap allocations.
+_Avoid_: Flow registry, connection manager
+
 **Quarantine Pool**:
 A delayed-reclamation FIFO buffer that retains retired flow contexts until all reader threads confirm passage through a quiescent state.
 _Avoid_: Trash ring, purgatory, deferred queue

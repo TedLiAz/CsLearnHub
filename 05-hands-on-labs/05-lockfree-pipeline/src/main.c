@@ -188,10 +188,6 @@ int main(int argc, char *argv[]) {
     CoreTopology topo = detect_or_parse_topology(cores_arg);
 
     /* ──── Subsystem Initialisation ──── */
-    flow_subsystem_init();
-    for (uint32_t i = 0; i < num_flows; ++i)
-        flow_open(i);
-
     static PipelineContext ctx;
     pipeline_init(&ctx, total_packets, num_flows);
     g_pipeline_ctx = &ctx;
@@ -284,16 +280,9 @@ int main(int argc, char *argv[]) {
     }
 
     /* Verify all flows returned to FREE state and contexts reclaimed */
-    for (uint32_t i = 0; i < num_flows; ++i) {
-        FlowState st = flow_get_state(i);
-        if (st != FLOW_STATE_FREE) {
-            fprintf(stderr, "FAIL: flow %u in state %u (expected FREE)\n", i, (uint32_t)st);
-            ok = false;
-        }
-        if (flow_get_context(i) != NULL) {
-            fprintf(stderr, "FAIL: flow %u flow_context not freed (UAF hazard!)\n", i);
-            ok = false;
-        }
+    if (!flow_table_audit_clean(&ctx.flow_table, num_flows)) {
+        fprintf(stderr, "FAIL: flow_table_audit_clean failed (UAF hazard or un-reclaimed flows)\n");
+        ok = false;
     }
 
     if (ok) {

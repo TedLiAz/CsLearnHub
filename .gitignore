@@ -40,4 +40,5 @@ env/
 
 # Agent Scratchpad & Temp Workspaces
 .scratch/
+reports/
 *.tmp

@@ -3,12 +3,18 @@
 
 void pipeline_init(PipelineContext *ctx, uint64_t total_packets, uint32_t num_flows) {
     memset(ctx, 0, sizeof(*ctx));
-    ctx->total_packets       = total_packets;
-    ctx->num_active_flows    = num_flows;
+    ctx->total_packets    = total_packets;
+    ctx->num_active_flows = num_flows;
 
     ring_buffer_init(&ctx->ring1, ctx->ring1_buf, RING_CAPACITY);
     ring_buffer_init(&ctx->ring2, ctx->ring2_buf, RING_CAPACITY);
     ring_buffer_init(&ctx->ctrl_ring, ctx->ctrl_ring_buf, RING_CAPACITY);
+
+    flow_table_init(&ctx->flow_table);
+    for (uint32_t i = 0; i < num_flows; ++i) {
+        flow_table_open(&ctx->flow_table, i);
+    }
+
     qsbr_init(&ctx->qsbr, 1);
 
     atomic_init(&ctx->ingress_packets_sent, 0);
@@ -54,14 +60,15 @@ static inline void process_pending_drains(PipelineContext *ctx) {
     while (ring_buffer_dequeue(&ctx->ctrl_ring, &req)) {
         uint32_t flow_id = req.handle.flow_id;
 
-        flow_set_state(flow_id, FLOW_STATE_DRAINING);
-        uint32_t cur_gen = flow_get_generation(flow_id);
+        flow_table_set_state(&ctx->flow_table, flow_id, FLOW_STATE_DRAINING);
+        uint32_t cur_gen = flow_table_get_generation(&ctx->flow_table, flow_id);
 
         PipelineMsg sentinel;
         pipeline_msg_init_drain_sentinel(&sentinel, flow_id, cur_gen);
 
-        while (!ring_buffer_enqueue(&ctx->ring1, &sentinel))
+        while (!ring_buffer_enqueue(&ctx->ring1, &sentinel)) {
             _mm_pause();
+        }
 
         ctx->ingress_stats.sentinels_sent++;
     }
@@ -87,12 +94,13 @@ void *ingress_thread(void *arg) {
              (ctx->ingress_stats.packets_sent + batch_len) < ctx->total_packets; ++i) {
             uint32_t flow_id = (pkt_gen_seq++) % ctx->num_active_flows;
 
-            FlowState st = flow_get_state(flow_id);
-            if (st != FLOW_STATE_ACTIVE)
+            FlowState st = flow_table_get_state(&ctx->flow_table, flow_id);
+            if (st != FLOW_STATE_ACTIVE) {
                 continue;
+            }
 
             any_active = true;
-            uint32_t gen = flow_get_generation(flow_id);
+            uint32_t gen = flow_table_get_generation(&ctx->flow_table, flow_id);
 
             pipeline_msg_init_packet(&batch[batch_len], flow_id, gen, flow_id, 64);
             batch_len++;
@@ -131,8 +139,9 @@ void *ingress_thread(void *arg) {
     PipelineMsg halt;
     pipeline_msg_init_halt(&halt);
 
-    while (!ring_buffer_enqueue(&ctx->ring1, &halt))
+    while (!ring_buffer_enqueue(&ctx->ring1, &halt)) {
         _mm_pause();
+    }
 
     return NULL;
 }
@@ -140,6 +149,17 @@ void *ingress_thread(void *arg) {
 /* ═══════════════════════════════════════════════════════════════════════════
  * Stage 2: Worker Stage (Generational Validation & Burst Forwarding)
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+static inline void burst_flush_to_ring(RingBuffer *ring, PipelineMsg *msgs, size_t *len) {
+    size_t sent = 0;
+    size_t total = *len;
+    while (sent < total) {
+        size_t n = ring_buffer_enqueue_burst(ring, msgs + sent, total - sent);
+        sent += n;
+        if (n == 0) _mm_pause();
+    }
+    *len = 0;
+}
 
 void *worker_thread(void *arg) {
     PipelineContext *ctx = (PipelineContext *)arg;
@@ -160,27 +180,21 @@ void *worker_thread(void *arg) {
             PipelineMsg *msg = &batch[i];
 
             if (__builtin_expect(msg->type == MSG_TYPE_PACKET, 1)) {
-                /* ──── FAST PATH: Dense Generation Array O(1) Check ──── */
-                uint32_t cur_gen = flow_get_generation(msg->handle.flow_id);
-
-                if (__builtin_expect(cur_gen == msg->handle.generation, 1)) {
-                    /* Valid handle: simulate core packet processing */
-                    (void)flow_get_context(msg->handle.flow_id);
+                /*
+                 * FAST PATH: Inlined O(1) Dense Generation Array Validation.
+                 * Single-cycle instruction load and branch-predicted compare.
+                 */
+                if (__builtin_expect(flow_table_validate(&ctx->flow_table, msg->handle), 1)) {
+                    /* Zero pointer chasing: direct flat array offset */
+                    FlowContext *fctx = flow_table_get_context(&ctx->flow_table, msg->handle.flow_id);
+                    (void)fctx;
 
                     out_batch[out_len++] = *msg;
                     ctx->worker_stats.packets_processed++;
 
-                    /* Flush full batch into Ring 2 */
+                    /* Flush full burst into Ring 2 */
                     if (out_len == BURST_SIZE) {
-                        size_t sent = 0;
-                        while (sent < out_len) {
-                            size_t n = ring_buffer_enqueue_burst(&ctx->ring2,
-                                                                 out_batch + sent,
-                                                                 out_len - sent);
-                            sent += n;
-                            if (n == 0) _mm_pause();
-                        }
-                        out_len = 0;
+                        burst_flush_to_ring(&ctx->ring2, out_batch, &out_len);
                     }
                 } else {
                     /* Stale generation: flow retired, silently drop to prevent UAF */
@@ -188,41 +202,27 @@ void *worker_thread(void *arg) {
                 }
             } else if (__builtin_expect(msg->type == MSG_TYPE_DRAIN_SENTINEL, 0)) {
                 /*
-                 * ──── DRAIN BARRIER PROTOCOL (ADR-0007) ────
+                 * DRAIN BARRIER PROTOCOL (ADR-0007)
                  * Synchronously flush all preceding accumulated data packets
                  * before enqueueing the sentinel to preserve strict FIFO retirement.
                  */
                 if (out_len > 0) {
-                    size_t sent = 0;
-                    while (sent < out_len) {
-                        size_t n = ring_buffer_enqueue_burst(&ctx->ring2,
-                                                             out_batch + sent,
-                                                             out_len - sent);
-                        sent += n;
-                        if (n == 0) _mm_pause();
-                    }
-                    out_len = 0;
+                    burst_flush_to_ring(&ctx->ring2, out_batch, &out_len);
                 }
 
-                while (!ring_buffer_enqueue(&ctx->ring2, msg))
+                while (!ring_buffer_enqueue(&ctx->ring2, msg)) {
                     _mm_pause();
+                }
                 ctx->worker_stats.sentinels_forwarded++;
             } else if (__builtin_expect(msg->type == MSG_TYPE_PIPELINE_HALT, 0)) {
                 /* Flush remaining valid batch before forwarding halt */
                 if (out_len > 0) {
-                    size_t sent = 0;
-                    while (sent < out_len) {
-                        size_t n = ring_buffer_enqueue_burst(&ctx->ring2,
-                                                             out_batch + sent,
-                                                             out_len - sent);
-                        sent += n;
-                        if (n == 0) _mm_pause();
-                    }
-                    out_len = 0;
+                    burst_flush_to_ring(&ctx->ring2, out_batch, &out_len);
                 }
 
-                while (!ring_buffer_enqueue(&ctx->ring2, msg))
+                while (!ring_buffer_enqueue(&ctx->ring2, msg)) {
                     _mm_pause();
+                }
 
                 /* Announce permanent quiescence before exit so reclaimer never blocks */
                 qsbr_thread_exit(&ctx->qsbr, QSBR_WORKER_THREAD);
@@ -232,15 +232,7 @@ void *worker_thread(void *arg) {
 
         /* Flush partial batch before quiescent epoch announcement to maintain low latency */
         if (out_len > 0) {
-            size_t sent = 0;
-            while (sent < out_len) {
-                size_t n = ring_buffer_enqueue_burst(&ctx->ring2,
-                                                     out_batch + sent,
-                                                     out_len - sent);
-                sent += n;
-                if (n == 0) _mm_pause();
-            }
-            out_len = 0;
+            burst_flush_to_ring(&ctx->ring2, out_batch, &out_len);
         }
 
         qsbr_quiescent(&ctx->qsbr, QSBR_WORKER_THREAD);
@@ -253,9 +245,6 @@ void *worker_thread(void *arg) {
 
 void *egress_thread(void *arg) {
     PipelineContext *ctx = (PipelineContext *)arg;
-    QuarantineRing quarantine;
-    quarantine_ring_init(&quarantine);
-
     PipelineMsg batch[BURST_SIZE];
     uint64_t pkt_counter = 0;
     uint32_t backoff = 0;
@@ -279,27 +268,22 @@ void *egress_thread(void *arg) {
 
                 /*
                  * Drain sentinel arrived at terminal stage:
-                 * 1. Monotonically increment generation, instantly invalidating stale handles.
-                 * 2. Mark state as FLOW_STATE_QUIESCENT.
-                 * 3. Advance global epoch and snapshot Target Epoch for quarantine.
+                 * Advance global epoch and retire to quarantine pool in FlowTable.
                  */
-                flow_advance_generation(msg->handle.flow_id);
-                flow_set_state(msg->handle.flow_id, FLOW_STATE_QUIESCENT);
-
                 uint64_t target_epoch = qsbr_advance_epoch(&ctx->qsbr);
-                QuarantineEntry entry = {
-                    .flow_id      = msg->handle.flow_id,
-                    .generation   = msg->handle.generation,
-                    .target_epoch = target_epoch
-                };
-                quarantine_ring_enqueue(&quarantine, &entry);
+                flow_table_retire_to_quarantine(&ctx->flow_table,
+                                                msg->handle.flow_id,
+                                                msg->handle.generation,
+                                                target_epoch);
             } else if (__builtin_expect(msg->type == MSG_TYPE_PIPELINE_HALT, 0)) {
                 /* Termination halt: advance epoch and drain all quarantined flows */
                 qsbr_advance_epoch(&ctx->qsbr);
-                while (quarantine.head != quarantine.tail) {
+                while (ctx->flow_table.quarantine.head != ctx->flow_table.quarantine.tail) {
                     ctx->egress_stats.flows_reclaimed +=
-                        try_reclaim_quarantined_flows(&quarantine, &ctx->qsbr);
-                    if (quarantine.head == quarantine.tail) break;
+                        flow_table_poll_reclaim(&ctx->flow_table, &ctx->qsbr);
+                    if (ctx->flow_table.quarantine.head == ctx->flow_table.quarantine.tail) {
+                        break;
+                    }
                     _mm_pause();
                 }
                 return NULL;
@@ -309,7 +293,7 @@ void *egress_thread(void *arg) {
         /* Periodic quiescent-state quarantine reclamation */
         if (pkt_counter >= QSBR_RECLAIM_INTERVAL) {
             ctx->egress_stats.flows_reclaimed +=
-                try_reclaim_quarantined_flows(&quarantine, &ctx->qsbr);
+                flow_table_poll_reclaim(&ctx->flow_table, &ctx->qsbr);
             pkt_counter = 0;
         }
     }
@@ -336,8 +320,9 @@ void *control_thread(void *arg) {
         PipelineMsg drain_req;
         pipeline_msg_init_drain_sentinel(&drain_req, flow, 0);
 
-        while (!ring_buffer_enqueue(&ctx->ctrl_ring, &drain_req))
+        while (!ring_buffer_enqueue(&ctx->ctrl_ring, &drain_req)) {
             _mm_pause();
+        }
 
         ctx->control_stats.drains_initiated++;
     }

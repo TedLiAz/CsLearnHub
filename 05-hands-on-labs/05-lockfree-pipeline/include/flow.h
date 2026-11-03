@@ -2,12 +2,14 @@
 #define FLOW_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdalign.h>
 #include <assert.h>
 
 #define MAX_FLOWS 1024
+#define QUARANTINE_RING_SIZE 256
 
 /*
  * Section 1: FlowHandle (Generational Handle Pattern)
@@ -35,8 +37,8 @@ typedef enum {
 } FlowState;
 
 /*
- * Simulated flow context — allocated on flow open, freed on QSBR quarantine reclaim.
- * In production this corresponds to a TLS session, flow table entry, or TCP socket state.
+ * Simulated flow context — allocated in a contiguous flat array inside FlowTable.
+ * Strictly eliminates heap allocations and pointer chasing on the fast path.
  */
 typedef struct {
     uint32_t flow_id;
@@ -44,7 +46,7 @@ typedef struct {
 } FlowContext;
 
 /*
- * Section 2: Hot-Cold Separated Flow Tables (ADR-0001)
+ * Section 2: Hot-Cold Separated Flow Layout (ADR-0001, Data-Oriented Design)
  *
  * Hot Table (Dense Generation Array):
  *   Packed densely so 16 flow generations occupy a single 64B cache line.
@@ -52,7 +54,7 @@ typedef struct {
  *
  * Cold Table (FlowColdContext):
  *   Padded and aligned to 64 bytes to eliminate false sharing during slow-path
- *   state transitions and context pointer reclamation.
+ *   state transitions.
  */
 typedef struct {
     atomic_uint generation;
@@ -63,43 +65,100 @@ static_assert(sizeof(FlowGenerationEntry) == 4,
 
 typedef struct {
     alignas(64) atomic_uint state;
-    uint32_t                rsvd;
-    void                   *flow_context;
-    uint8_t                 pad[48];
+    uint8_t                 pad[64 - sizeof(atomic_uint)];
 } __attribute__((aligned(64))) FlowColdContext;
 
 static_assert(sizeof(FlowColdContext) == 64,
               "FlowColdContext must occupy exactly one cache line");
 
-/* Unified logical view of a flow slot */
+/* Single-threaded FIFO quarantine ring owned strictly by the Terminal/Egress reclaimer */
 typedef struct {
-    alignas(64) atomic_uint generation;
-    atomic_uint             state;
-    void                   *flow_context;
-    uint8_t                 pad[64 - sizeof(atomic_uint) * 2 - sizeof(void *)];
-} __attribute__((aligned(64))) FlowControlBlock;
+    uint32_t flow_id;
+    uint32_t generation;
+    uint64_t target_epoch;
+} QuarantineEntry;
 
-static_assert(sizeof(FlowControlBlock) == 64,
-              "FlowControlBlock must occupy exactly one cache line");
+typedef struct {
+    QuarantineEntry entries[QUARANTINE_RING_SIZE];
+    size_t head;
+    size_t tail;
+} QuarantineRing;
 
-/* ──────── Flow Management APIs ──────── */
+/* Forward declaration of QSBRModule to decouple flow table from QSBR internals */
+struct QSBRModule;
 
-void flow_subsystem_init(void);
+/*
+ * Section 3: FlowTable (Unified Data-Oriented Flow Table Instance)
+ *
+ * Encapsulates the Dense Generation Array, Cold Context Table, Flat Context Pool,
+ * and Quarantine Ring into a single cacheline-aligned instance with zero static globals.
+ */
+typedef struct {
+    /* Hot Area: Dense Generation Array (16 flows per 64B Cache Line) */
+    alignas(64) FlowGenerationEntry generations[MAX_FLOWS];
 
-void flow_open(uint32_t flow_id);
+    /* Cold Area: State flags cacheline-isolated to prevent false sharing */
+    alignas(64) FlowColdContext     cold[MAX_FLOWS];
 
-uint32_t flow_get_generation(uint32_t flow_id);
+    /* Flat Context Pool: Pre-allocated contiguous memory, zero malloc */
+    alignas(64) FlowContext         contexts[MAX_FLOWS];
 
-FlowState flow_get_state(uint32_t flow_id);
+    /* Dedicated Single-Threaded Quarantine Pool (Egress thread owned) */
+    alignas(64) QuarantineRing      quarantine;
+} __attribute__((aligned(64))) FlowTable;
 
-void *flow_get_context(uint32_t flow_id);
+/* ──────── Fast-Path Inlined APIs (Zero Function Call Overhead) ──────── */
 
-FlowControlBlock *flow_get_fcb(uint32_t flow_id);
+static inline bool flow_table_validate(const FlowTable *ft, FlowHandle handle) {
+    if (__builtin_expect(handle.flow_id >= MAX_FLOWS, 0)) {
+        return false;
+    }
+    uint32_t cur = atomic_load_explicit(&ft->generations[handle.flow_id].generation,
+                                       memory_order_acquire);
+    return (cur == handle.generation);
+}
 
-void flow_advance_generation(uint32_t flow_id);
+static inline FlowContext *flow_table_get_context(FlowTable *ft, uint32_t flow_id) {
+    assert(flow_id < MAX_FLOWS);
+    return &ft->contexts[flow_id];
+}
 
-void flow_set_state(uint32_t flow_id, FlowState state);
+static inline const FlowContext *flow_table_get_context_const(const FlowTable *ft, uint32_t flow_id) {
+    assert(flow_id < MAX_FLOWS);
+    return &ft->contexts[flow_id];
+}
 
-void flow_reclaim_context(uint32_t flow_id);
+static inline uint32_t flow_table_get_generation(const FlowTable *ft, uint32_t flow_id) {
+    assert(flow_id < MAX_FLOWS);
+    return atomic_load_explicit(&ft->generations[flow_id].generation,
+                                memory_order_acquire);
+}
+
+static inline FlowState flow_table_get_state(const FlowTable *ft, uint32_t flow_id) {
+    assert(flow_id < MAX_FLOWS);
+    return (FlowState)atomic_load_explicit(&ft->cold[flow_id].state,
+                                           memory_order_acquire);
+}
+
+/* ──────── Slow-Path Management APIs ──────── */
+
+void flow_table_init(FlowTable *ft);
+
+void flow_table_open(FlowTable *ft, uint32_t flow_id);
+
+void flow_table_set_state(FlowTable *ft, uint32_t flow_id, FlowState state);
+
+void flow_table_advance_generation(FlowTable *ft, uint32_t flow_id);
+
+bool flow_table_retire_to_quarantine(
+    FlowTable *ft,
+    uint32_t flow_id,
+    uint32_t generation,
+    uint64_t target_epoch
+);
+
+uint64_t flow_table_poll_reclaim(FlowTable *ft, struct QSBRModule *qsbr);
+
+bool flow_table_audit_clean(const FlowTable *ft, uint32_t num_flows);
 
 #endif /* FLOW_H */
