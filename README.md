@@ -55,4 +55,4 @@ npx quartz build --serve
 - ⚡ [04-concurrency-and-algorithms/memory-order-deep-dive.md](./04-concurrency-and-algorithms/memory-order-deep-dive.md)  
   *系统阐述 C11/C++11 内存模型底层原理，从编译器屏障、CPU 内存屏障、Happens-Before 偏序关系到 6 种 memory_order 的硬件级开销与最佳工程实践。*
 - 🧪 [05-hands-on-labs/05-lockfree-pipeline](./05-hands-on-labs/05-lockfree-pipeline/)  
-  *完整 C11 模块化无锁流水线工程实现，结合 ThreadSanitizer 验证与 Linux perf 压测套件，实现千万 PPS 场景下的零数据竞争与确定性回收。*
+  *完整 C11 模块化无锁流水线工程实现，结合 ThreadSanitizer 验证与 Linux perf 压测套件，实现 63+ Mpps（纯计时 80+ Mpps）吞吐与 QSBR 确定性回收。*
