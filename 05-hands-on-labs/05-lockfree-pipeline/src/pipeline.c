@@ -161,6 +161,57 @@ static inline void burst_flush_to_ring(RingBuffer *ring, PipelineMsg *msgs, size
     *len = 0;
 }
 
+/*
+ * Section: Cold Slow-Path Outlining (__attribute__((cold)) __attribute__((noinline)))
+ *
+ * Physically segregates control signaling (DrainSentinel pre-flush and Halt) into the
+ * .text.cold segment, shrinking the fast-path loop machine code below 64 bytes.
+ * This directly activates the CPU hardware Loop Stream Detector (LSD / uop cache).
+ */
+static void worker_handle_drain_sentinel_cold(
+    PipelineContext *ctx,
+    PipelineMsg *msg,
+    PipelineMsg *out_batch,
+    size_t *out_len
+) __attribute__((cold)) __attribute__((noinline));
+
+static void worker_handle_drain_sentinel_cold(
+    PipelineContext *ctx,
+    PipelineMsg *msg,
+    PipelineMsg *out_batch,
+    size_t *out_len
+) {
+    if (*out_len > 0) {
+        burst_flush_to_ring(&ctx->ring2, out_batch, out_len);
+    }
+    while (!ring_buffer_enqueue(&ctx->ring2, msg)) {
+        _mm_pause();
+    }
+    ctx->worker_stats.sentinels_forwarded++;
+}
+
+static void worker_handle_halt_cold(
+    PipelineContext *ctx,
+    PipelineMsg *msg,
+    PipelineMsg *out_batch,
+    size_t *out_len
+) __attribute__((cold)) __attribute__((noinline));
+
+static void worker_handle_halt_cold(
+    PipelineContext *ctx,
+    PipelineMsg *msg,
+    PipelineMsg *out_batch,
+    size_t *out_len
+) {
+    if (*out_len > 0) {
+        burst_flush_to_ring(&ctx->ring2, out_batch, out_len);
+    }
+    while (!ring_buffer_enqueue(&ctx->ring2, msg)) {
+        _mm_pause();
+    }
+    qsbr_thread_exit(&ctx->qsbr, QSBR_WORKER_THREAD);
+}
+
 void *worker_thread(void *arg) {
     PipelineContext *ctx = (PipelineContext *)arg;
     PipelineMsg batch[BURST_SIZE];
@@ -185,7 +236,6 @@ void *worker_thread(void *arg) {
                  * Single-cycle instruction load and branch-predicted compare.
                  */
                 if (__builtin_expect(flow_table_validate(&ctx->flow_table, msg->handle), 1)) {
-                    /* Zero pointer chasing: direct flat array offset */
                     FlowContext *fctx = flow_table_get_context(&ctx->flow_table, msg->handle.flow_id);
                     (void)fctx;
 
@@ -201,31 +251,9 @@ void *worker_thread(void *arg) {
                     ctx->worker_stats.packets_dropped++;
                 }
             } else if (__builtin_expect(msg->type == MSG_TYPE_DRAIN_SENTINEL, 0)) {
-                /*
-                 * DRAIN BARRIER PROTOCOL (ADR-0007)
-                 * Synchronously flush all preceding accumulated data packets
-                 * before enqueueing the sentinel to preserve strict FIFO retirement.
-                 */
-                if (out_len > 0) {
-                    burst_flush_to_ring(&ctx->ring2, out_batch, &out_len);
-                }
-
-                while (!ring_buffer_enqueue(&ctx->ring2, msg)) {
-                    _mm_pause();
-                }
-                ctx->worker_stats.sentinels_forwarded++;
+                worker_handle_drain_sentinel_cold(ctx, msg, out_batch, &out_len);
             } else if (__builtin_expect(msg->type == MSG_TYPE_PIPELINE_HALT, 0)) {
-                /* Flush remaining valid batch before forwarding halt */
-                if (out_len > 0) {
-                    burst_flush_to_ring(&ctx->ring2, out_batch, &out_len);
-                }
-
-                while (!ring_buffer_enqueue(&ctx->ring2, msg)) {
-                    _mm_pause();
-                }
-
-                /* Announce permanent quiescence before exit so reclaimer never blocks */
-                qsbr_thread_exit(&ctx->qsbr, QSBR_WORKER_THREAD);
+                worker_handle_halt_cold(ctx, msg, out_batch, &out_len);
                 return NULL;
             }
         }

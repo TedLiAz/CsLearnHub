@@ -88,7 +88,7 @@ static inline bool ring_buffer_dequeue(RingBuffer *ring, PipelineMsg *msg) {
     return true;
 }
 
-/* ──────────── Burst Enqueue (amortises atomic release across N messages) ──────────── */
+/* ──────────── Chunked Burst Enqueue (Two-slice contiguous block copy) ──────────── */
 static inline size_t ring_buffer_enqueue_burst(
     RingBuffer *ring,
     const PipelineMsg *msgs,
@@ -104,15 +104,26 @@ static inline size_t ring_buffer_enqueue_burst(
         if (n > available) n = available;
     }
 
-    size_t mask = ring->meta.mask;
-    for (size_t i = 0; i < n; ++i)
-        ring->meta.entries[(head + i) & mask] = msgs[i];
+    size_t mask  = ring->meta.mask;
+    size_t idx   = head & mask;
+    size_t first = ring->meta.capacity - idx;
+    if (first > n) first = n;
+
+    /*
+     * Contiguous block copy: eliminates N scalar modulo operations.
+     * Compiler vectorizes 32B aligned chunks directly to AVX2 vmovdqa streaming.
+     */
+    memcpy(&ring->meta.entries[idx], msgs, first * sizeof(PipelineMsg));
+    size_t second = n - first;
+    if (__builtin_expect(second > 0, 0)) {
+        memcpy(&ring->meta.entries[0], msgs + first, second * sizeof(PipelineMsg));
+    }
 
     atomic_store_explicit(&ring->prod.head, head + n, memory_order_release);
     return n;
 }
 
-/* ──────────── Burst Dequeue (amortises atomic release across N messages) ──────────── */
+/* ──────────── Chunked Burst Dequeue (Two-slice contiguous block copy) ──────────── */
 static inline size_t ring_buffer_dequeue_burst(
     RingBuffer *ring,
     PipelineMsg *msgs,
@@ -128,12 +139,70 @@ static inline size_t ring_buffer_dequeue_burst(
         if (n > available) n = available;
     }
 
-    size_t mask = ring->meta.mask;
-    for (size_t i = 0; i < n; ++i)
-        msgs[i] = ring->meta.entries[(tail + i) & mask];
+    size_t mask  = ring->meta.mask;
+    size_t idx   = tail & mask;
+    size_t first = ring->meta.capacity - idx;
+    if (first > n) first = n;
+
+    /*
+     * Contiguous block copy: eliminates N scalar modulo operations.
+     */
+    memcpy(msgs, &ring->meta.entries[idx], first * sizeof(PipelineMsg));
+    size_t second = n - first;
+    if (__builtin_expect(second > 0, 0)) {
+        memcpy(msgs + first, &ring->meta.entries[0], second * sizeof(PipelineMsg));
+    }
 
     atomic_store_explicit(&ring->cons.tail, tail + n, memory_order_release);
     return n;
+}
+
+/* ──────────── Direct Zero-Copy Slice Peek API ──────────── */
+static inline size_t ring_buffer_peek_slice(
+    RingBuffer *ring,
+    PipelineMsg **slice1,
+    size_t *len1,
+    PipelineMsg **slice2,
+    size_t *len2,
+    size_t max_n
+) {
+    size_t tail      = atomic_load_explicit(&ring->cons.tail, memory_order_relaxed);
+    size_t available = ring->cons.cached_head - tail;
+
+    if (available < max_n) {
+        ring->cons.cached_head = atomic_load_explicit(&ring->prod.head, memory_order_acquire);
+        available = ring->cons.cached_head - tail;
+        if (available == 0) {
+            *slice1 = NULL; *len1 = 0;
+            *slice2 = NULL; *len2 = 0;
+            return 0;
+        }
+        if (max_n > available) max_n = available;
+    }
+
+    size_t mask  = ring->meta.mask;
+    size_t idx   = tail & mask;
+    size_t first = ring->meta.capacity - idx;
+    if (first > max_n) first = max_n;
+
+    *slice1 = &ring->meta.entries[idx];
+    *len1   = first;
+
+    size_t second = max_n - first;
+    if (__builtin_expect(second > 0, 0)) {
+        *slice2 = &ring->meta.entries[0];
+        *len2   = second;
+    } else {
+        *slice2 = NULL;
+        *len2   = 0;
+    }
+
+    return max_n;
+}
+
+static inline void ring_buffer_advance_tail(RingBuffer *ring, size_t n) {
+    size_t tail = atomic_load_explicit(&ring->cons.tail, memory_order_relaxed);
+    atomic_store_explicit(&ring->cons.tail, tail + n, memory_order_release);
 }
 
 #endif /* RING_BUFFER_H */
