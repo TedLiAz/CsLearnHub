@@ -289,8 +289,10 @@ int main(int argc, char *argv[]) {
         printf("✓ All integrity checks passed. No UAF, no leaks, no data races.\n\n");
     } else {
         printf("✗ Some integrity checks failed. See errors above.\n\n");
+        pipeline_destroy(&ctx);
         return 1;
     }
 
+    pipeline_destroy(&ctx);
     return 0;
 }

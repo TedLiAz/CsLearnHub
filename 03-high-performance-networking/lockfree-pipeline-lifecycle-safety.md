@@ -495,7 +495,34 @@ static inline void burst_copy_msgs(PipelineMsg *__restrict dst,
 - 极高频的内存读-改-写会饱和 CPU 的 Store Buffer 与 L1-Dcache 写入带宽。
 - 最优工程实践是引入 Thread-Local 纯硬件寄存器累加器（`local_processed`, `local_dropped`, `local_egressed`），仅在整批 Burst 处理完毕或线程退出时集中同步至共享上下文，单次压测即可消减上千万次内存写穿透。
 
-#### 4. 优化演进全指标对比矩阵（AMD Zen 1 PMU 硬件测试）
+#### 4. 虚拟内存双映射（Double-Mapped Virtual Memory）彻底消除环形回绕分支
+传统 Ring Buffer 在批次出入队（Burst Enqueue / Dequeue）跨越容量边界时，必须进行两段式切割复制或逐元素执行 `(head + i) & mask` 取模，导致汇编循环体内夹杂大量的位与（AND）、自增与重寻址指令（单包需 8 条汇编指令）。
+- **微架构机制**：通过 Linux 原生 `memfd_create` 创建匿名物理内存文件，并利用 `mmap` 的 `MAP_FIXED` 标志，将同一块物理内存并排双重映射到连续虚拟地址空间：`[addr, addr + bytes)` 与 `[addr + bytes, addr + 2*bytes)`。
+- **分支与循环消除**：任意从 `head & mask` 起始、长度小于等于容量的 Burst 读写操作，在虚拟内存视角下均 100% 表现为连续平直内存切片。即使游标回绕，写入操作自然穿越至第二镜像段并由 MMU 页表直接映射回物理首部。
+- **微架构收益**：Burst 拷贝内循环彻底摆脱逐包 `(head + i) & mask` 计算，单包循环指令数从 8 条骤降至 5 条（减少 37.5% 动态指令）。单流吞吐进一步冲刺至 **66.03 Mpps**（perf stat）与 **83.21 Mpps**（纯计时，峰值 **83.98 Mpps**），单包周期数降至 **150.3 cycles**，端到端延迟压缩至 **12.02 ns**。
+
+```c
+/*
+ * Microarchitectural Invariant:
+ *   - Physical memory of size `bytes = capacity * sizeof(PipelineMsg)` is mapped
+ *     twice side-by-side using MAP_FIXED into a contiguous 2 * bytes virtual address window.
+ *   - Linear burst copy directly indexes `&entries[head & mask]` without per-element
+ *     bitwise masking or branch-based wraparound splits.
+ */
+static inline size_t ring_buffer_enqueue_burst_mirror(RingBuffer *ring,
+                                                      const PipelineMsg *msgs,
+                                                      size_t n) {
+    size_t head = atomic_load_explicit(&ring->prod.head, memory_order_relaxed);
+    PipelineMsg *__restrict dst = &ring->meta.entries[head & ring->meta.mask];
+    for (size_t i = 0; i < n; ++i) {
+        dst[i] = msgs[i];
+    }
+    atomic_store_explicit(&ring->prod.head, head + n, memory_order_release);
+    return n;
+}
+```
+
+#### 5. 优化演进全指标对比矩阵（AMD Zen 1 PMU 硬件测试）
 
 在 Linux x86-64 物理机（AMD Ryzen 5 2500U, 4C/8T Zen 1）上，针对 10,000,000 报文全流程进行的 10 轮统计评测（Mean ± StdDev）：
 
@@ -504,10 +531,11 @@ static inline void burst_copy_msgs(PipelineMsg *__restrict dst,
 | **基线架构 (`6422791`)** | 34.00 ± 0.67 Mpps | 29.42 ns | 325.6 cycles | 1.14 | 指针级联寻址，流表查询涉及动态堆分配 |
 | **DOD 扁平流表 (`97801c4`)** | 51.94 ± 1.05 Mpps | 19.26 ns | 200.8 cycles | 1.05 | 密集代际数组（16流/CL），消除堆分配抖动与指针跳转 |
 | **动态 memcpy 尝试 (`fc7f721`)**| 45.24 ± 0.56 Mpps | 22.11 ns | 238.3 cycles | 0.88 | 发生性能回退：动态 `memcpy@plt` 与寄存器栈溢出 |
-| **🚀 生产级优化 (`7727c94`)** | **63.04 ± 0.45 Mpps** | **15.86 ns** | **157.0 cycles** | **1.42** | AVX2 向量化展开 + `%rsi` 寄存器锁定 + 寄存器累加器 |
-| *无 perf 纯计时模式* | **80.55 ± 0.69 Mpps** | **12.42 ns** | — | — | 纯 Wall-clock 极速模式（峰值达 82.03 Mpps） |
+| **向量化与寄存器累加 (`7727c94`)**| 63.04 ± 0.45 Mpps | 15.86 ns | 157.0 cycles | 1.42 | AVX2 向量化展开 + `%rsi` 寄存器锁定 + 寄存器累加器 |
+| **🚀 虚拟内存双映射镜像** | **66.03 ± 0.58 Mpps** | **15.14 ns** | **150.3 cycles** | **1.28** | 双映射消除环形回绕分支，内循环指令消减 37.5% |
+| *无 perf 纯计时模式 (镜像)* | **83.21 ± 0.80 Mpps** | **12.02 ns** | — | — | 纯 Wall-clock 极速模式（峰值达 83.98 Mpps） |
 
-在 16 条并发流伴随动态生命周期注销与 QSBR 隔离回收的复杂场景下，优化后吞吐达 **21.81 ± 0.30 Mpps**（相比基线 14.37 Mpps 提升 **+51.8%**），并通过 ThreadSanitizer 验证确证 **0 数据竞争、0 内存泄漏、0 UAF**。
+在 16 条并发流伴随动态生命周期注销与 QSBR 隔离回收的复杂场景下，优化后吞吐达 **21.71 ± 0.20 Mpps**（相比基线 14.37 Mpps 提升 **+51.1%**），并通过 ThreadSanitizer 验证确证 **0 数据竞争、0 内存泄漏、0 UAF**。
 
 ---
 

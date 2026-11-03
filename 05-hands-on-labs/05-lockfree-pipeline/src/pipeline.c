@@ -1,4 +1,6 @@
 #include "pipeline.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <immintrin.h>
 
 void pipeline_init(PipelineContext *ctx, uint64_t total_packets, uint32_t num_flows) {
@@ -6,9 +8,12 @@ void pipeline_init(PipelineContext *ctx, uint64_t total_packets, uint32_t num_fl
     ctx->total_packets    = total_packets;
     ctx->num_active_flows = num_flows;
 
-    ring_buffer_init(&ctx->ring1, ctx->ring1_buf, RING_CAPACITY);
-    ring_buffer_init(&ctx->ring2, ctx->ring2_buf, RING_CAPACITY);
-    ring_buffer_init(&ctx->ctrl_ring, ctx->ctrl_ring_buf, RING_CAPACITY);
+    if (!ring_buffer_init_mmap(&ctx->ring1, RING_CAPACITY) ||
+        !ring_buffer_init_mmap(&ctx->ring2, RING_CAPACITY) ||
+        !ring_buffer_init_mmap(&ctx->ctrl_ring, RING_CAPACITY)) {
+        fprintf(stderr, "Failed to allocate double-mapped virtual memory rings\n");
+        exit(1);
+    }
 
     flow_table_init(&ctx->flow_table);
     for (uint32_t i = 0; i < num_flows; ++i) {
@@ -20,6 +25,14 @@ void pipeline_init(PipelineContext *ctx, uint64_t total_packets, uint32_t num_fl
     atomic_init(&ctx->ingress_packets_sent, 0);
     atomic_init(&ctx->control_done, false);
     atomic_init(&ctx->ingress_done, false);
+}
+
+void pipeline_destroy(PipelineContext *ctx) {
+    if (ctx != NULL) {
+        ring_buffer_destroy_mmap(&ctx->ring1);
+        ring_buffer_destroy_mmap(&ctx->ring2);
+        ring_buffer_destroy_mmap(&ctx->ctrl_ring);
+    }
 }
 
 /*

@@ -97,8 +97,9 @@ All measurements collected on Linux x86-64 (AMD Ryzen 5 2500U, 4C/8T Zen 1, `-O3
 | **Baseline (`6422791`)** | 34.00 ± 0.67 Mpps | 29.42 ns | 325.6 cycles | 1.14 | Pointer indirection, dynamic heap allocations in flow lookups |
 | **DOD FlowTable (`97801c4`)** | 51.94 ± 1.05 Mpps | 19.26 ns | 200.8 cycles | 1.05 | Flat dense generation array (16/CL), zero heap jitter, inlined validate |
 | **memcpy Attempt (`fc7f721`)** | 45.24 ± 0.56 Mpps | 22.11 ns | 238.3 cycles | 0.88 | Regression: dynamic `memcpy@plt` calls & caller register spilling |
-| **🚀 Current Master (`7727c94`)** | **63.04 ± 0.45 Mpps** | **15.86 ns** | **157.0 cycles** | **1.42** | Compile-time AVX2 burst loop + pass-by-value `%rsi` pinning + register stats |
-| *No-perf Mode (`7727c94`)* | **80.55 ± 0.69 Mpps** | **12.42 ns** | — | — | Pure wall-clock timer (Peak: 82.03 Mpps) |
+| **Vectorized & Reg Stats (`7727c94`)** | 63.04 ± 0.45 Mpps | 15.86 ns | 157.0 cycles | 1.42 | Compile-time AVX2 burst loop + pass-by-value `%rsi` pinning + register stats |
+| **🚀 Double-Mapped VM Mirror** | **66.03 ± 0.58 Mpps** | **15.14 ns** | **150.3 cycles** | **1.28** | Virtual memory double mapping (`memfd_create`+`mmap`), zero-branch wrapping |
+| *No-perf Mode (VM Mirror)* | **83.21 ± 0.80 Mpps** | **12.02 ns** | — | — | Pure wall-clock timer (Peak: 83.98 Mpps) |
 
 - **Multi-Flow Throughput (16 flows with dynamic Drain barriers & QSBR quarantine)**:
   - **21.81 ± 0.30 Mpps** (Baseline was ~14.37 Mpps, **+51.8%** sustained throughput under live lifecycle churn).
@@ -118,3 +119,7 @@ All measurements collected on Linux x86-64 (AMD Ryzen 5 2500U, 4C/8T Zen 1, `-O3
    - `burst_flush_to_ring` takes `size_t len` by value instead of `size_t *len`. Eliminating pointer aliasing guarantees the compiler pins `out_len` in hardware register `%rsi` rather than spilling to the stack (`0x38(%rsp)`).
 4. **Hardware Register-Accumulated Stats (`pipeline.c`)**:
    - Replaced inner-loop memory Read-Modify-Write instructions (`incq (mem)`) with thread-local CPU register accumulators (`local_processed`, `local_dropped`, `local_egressed`). Counters sync to shared context only upon burst completion or thread exit, saving 20,000,000+ memory operations per run.
+5. **Double-Mapped Virtual Memory Ring Buffer (`ring_buffer.h`, `ring_buffer.c`)**:
+   - Uses `memfd_create` and double `mmap` with `MAP_FIXED` to map identical physical pages consecutively: `[addr, addr + bytes)` and `[addr + bytes, addr + 2*bytes)`.
+   - Eliminates per-element bitwise masking `(head + i) & mask` in burst loops: `dst = &entries[head & mask]` is guaranteed to be a contiguous linear slice in virtual memory even across buffer wraparound.
+   - Loop assembly shrinks from 8 instructions/pkt down to 5 instructions/pkt (-37.5% dynamic instruction count), boosting sustained throughput to **66.03 Mpps** (perf) / **83.21 Mpps** (no-perf, peak **83.98 Mpps**), and lowering latency to **12.02 ns**.

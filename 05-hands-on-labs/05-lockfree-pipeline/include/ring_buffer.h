@@ -57,6 +57,8 @@ static_assert(offsetof(RingBuffer, cons) == 64,  "cons at offset 64");
 static_assert(offsetof(RingBuffer, meta) == 128, "meta at offset 128");
 
 void ring_buffer_init(RingBuffer *ring, PipelineMsg *buffer, size_t capacity);
+bool ring_buffer_init_mmap(RingBuffer *ring, size_t capacity);
+void ring_buffer_destroy_mmap(RingBuffer *ring);
 
 /* ──────────── Single Enqueue ──────────── */
 static inline bool ring_buffer_enqueue(RingBuffer *ring, const PipelineMsg *msg) {
@@ -129,9 +131,18 @@ static inline size_t ring_buffer_enqueue_burst(
         if (n > available) n = available;
     }
 
-    size_t mask = ring->meta.mask;
+    /*
+     * Linear Burst Copy via Virtual Memory Mirroring:
+     * With double-mapped virtual memory, `entries[0 .. capacity - 1]` and
+     * `entries[capacity .. 2 * capacity - 1]` point to identical physical pages.
+     * Any burst slice starting at `head & mask` with length `n <= capacity` is
+     * guaranteed to be contiguous in virtual memory.
+     * This eliminates per-element bitwise masking `(head + i) & mask` and branches,
+     * reducing loop instructions to a direct AVX2 256-bit unrolled stream.
+     */
+    PipelineMsg *__restrict dst = &ring->meta.entries[head & ring->meta.mask];
     for (size_t i = 0; i < n; ++i)
-        ring->meta.entries[(head + i) & mask] = msgs[i];
+        dst[i] = msgs[i];
 
     /*
      * Happens-before pair:
@@ -145,7 +156,7 @@ static inline size_t ring_buffer_enqueue_burst(
 /*
  * Microarchitectural Design Rationale:
  * Mirror of `ring_buffer_enqueue_burst`. Amortizes cross-core acquire synchronization across
- * N messages while compiler auto-vectorizes entry copies into 256-bit AVX2 registers.
+ * N messages while reading from contiguous double-mapped virtual memory without wrapping checks.
  */
 static inline size_t ring_buffer_dequeue_burst(
     RingBuffer *ring,
@@ -162,9 +173,9 @@ static inline size_t ring_buffer_dequeue_burst(
         if (n > available) n = available;
     }
 
-    size_t mask = ring->meta.mask;
+    const PipelineMsg *__restrict src = &ring->meta.entries[tail & ring->meta.mask];
     for (size_t i = 0; i < n; ++i)
-        msgs[i] = ring->meta.entries[(tail + i) & mask];
+        msgs[i] = src[i];
 
     /*
      * Happens-before pair:

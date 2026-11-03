@@ -46,9 +46,6 @@ typedef struct {
     RingBuffer              ring1;
     RingBuffer              ring2;
     RingBuffer              ctrl_ring;
-    alignas(64) PipelineMsg ring1_buf[RING_CAPACITY];
-    alignas(64) PipelineMsg ring2_buf[RING_CAPACITY];
-    alignas(64) PipelineMsg ctrl_ring_buf[RING_CAPACITY];
     FlowTable               flow_table;
     QSBRModule              qsbr;
 
@@ -68,6 +65,7 @@ typedef struct {
 /* ──────── Pipeline Stage Prototypes ──────── */
 
 void pipeline_init(PipelineContext *ctx, uint64_t total_packets, uint32_t num_flows);
+void pipeline_destroy(PipelineContext *ctx);
 
 void *ingress_thread(void *arg);
 
